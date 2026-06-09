@@ -1,0 +1,185 @@
+# Here is the main workflow used for processing paired-end WGS data in a project devoted to the phylogeny of true lemmings.
+# The pipeline starts with raw sequencing reads and ends with a filtered VCF file.
+# It is not a single automated pipeline but rather a collection of separate scripts that were run in different directories. The results of each step were checked manually before proceeding to the next stage.
+# Some minor steps may be omitted, but the overall workflow and main processing strategy are represented here. 
+
+#### STEP1 trimming raw reads with bbduk from bbtools
+#!/usr/bin/bash
+for f in *R1.fastq.gz; do
+echo "##################################################">>trimmed2/trim_log.txt
+echo ${f%_R1.*}>>trimmed2/trim_log.txt
+bbduk.sh in1=$f in2=${f%R1.*}R2.fastq.gz out1=trimmed2/${f%R1.*}tr_R1.fastq.gz out2=trimmed2/${f%R1.*}tr_R2.fastq.gz ref=adapters.fa k=12 mink=12 ktrim=r minlen=30 tpe \
+qtrim=r trimq=16 stats=trimmed2/${f%R1.*}kstats 2>>trimmed2/trim_log.txt
+done
+
+
+
+#### STEP2 alignment of trimmed reads on reference with bwa mem and filtering
+#!/usr/bin/bash
+t=10
+REF="$HOME/ref/lemmus/combined/genome.fa"
+for f in *R1.fastq.gz; do
+    R2=${f%R1*}R2.fastq.gz
+    out=${f%_R*}_pure.bam
+bwa mem -t "$t" "$REF" $f $R2 |\
+# Step 1: Convert SAM to BAM, mapped only
+samtools view -@ "$t" -Sb -F 2828 -f 2 |\
+# retain only properly paired reads
+# Step 2: Name sort for fixmate
+samtools sort -@ "$t" -n - | \
+# Step 3: Fixmate "
+samtools fixmate -@ "$t" -m - - | \
+# Step 4: Coordinate sort
+samtools sort -@ "$t" -o "${f%_t*}_sorted.bam"
+# Step 5: Mark duplicates
+samtools markdup -@ "$t" "${f%_t*}_sorted.bam" "$out"
+echo " Done with ${f%_t*}"
+done
+
+
+
+#### Intermediate step - get coordinates of reference's chunks for subsequent parallel calling with bcftools
+#!/usr/bin/env bash
+# ==========================================================
+# Split reference genome into balanced regions usable by
+# bcftools (-r) or GATK (-L)
+#
+# OUTPUT FORMAT:
+#   chr:start-end
+#
+# Usage:
+#   make_genome_regions.sh reference.fasta N_chunks [output.txt]
+#
+# Example:
+#   ./make_genome_regions.sh ref.fa 120 regions.txt
+# ==========================================================
+set -euo pipefail
+# -------- arguments --------
+REF="$1"
+NCHUNKS="$2"
+OUT="${3:-genome_regions.txt}"
+# -------- dependency checks --------
+command -v samtools >/dev/null || {
+    echo "ERROR: samtools not found"; exit 1; }
+command -v bedtools >/dev/null || {
+    echo "ERROR: bedtools not found"; exit 1; }
+[[ -f "$REF" ]] || { echo "ERROR: reference not found"; exit 1; }
+# -------- index fasta if needed --------
+if [[ ! -f "${REF}.fai" ]]; then
+    echo "Indexing reference..."
+    samtools faidx "$REF"
+fi
+# -------- genome sizes --------
+GENOME=$(mktemp)
+cut -f1,2 "${REF}.fai" > "$GENOME"
+# -------- total genome length --------
+TOTAL=$(awk '{sum+=$2} END{print sum}' "$GENOME")
+# -------- compute window size --------
+WINDOW=$(awk -v T="$TOTAL" -v N="$NCHUNKS" \
+'BEGIN{ printf "%.0f", T/N }')
+echo "Total genome size: $TOTAL bp"
+echo "Requested chunks:  $NCHUNKS"
+echo "Window size:       $WINDOW bp"
+TMPBED=$(mktemp)
+# -------- create BED windows --------
+bedtools makewindows \
+    -g "$GENOME" \
+    -w "$WINDOW" > "$TMPBED"
+# -------- convert BED -> region strings --------
+# BED: 0-based, half-open
+# Regions: 1-based, inclusive
+awk 'BEGIN{OFS=""}
+{
+    start=$2+1
+    end=$3
+    print $1,":",start,"-",end
+}' "$TMPBED" > "$OUT"
+rm "$GENOME" "$TMPBED"
+echo "DONE"
+echo "Regions written to: $OUT"
+echo "Total regions: $(wc -l < "$OUT")"
+
+
+
+#### STEP3 - hard calling with bcftools and subsequent arranging of region vcfs by the type of scaffolds
+#!/usr/bin/env bash
+set -euo pipefail
+#################################################
+# USER SETTINGS
+#################################################
+tech_f="1scripts"
+REFERENCE="$HOME/ref/lemmus/combined/genome.fa"
+BAMFILES="${tech_f}/bams.txt"
+PLOIDYFILE="${tech_f}/ploidy.txt"
+SEXFILE="${tech_f}/sex.txt"
+REGIONS="${tech_f}/ref_chunks_100"
+PREFIX="lemmus"
+# Filtering
+maxsampledepth=800
+NJOBS=30
+export REFERENCE BAMFILES PLOIDYFILE SEXFILE PREFIX maskdepth maxsampledepth
+#################################################
+# CALLING FUNCTION
+#################################################
+call_region () {
+    REGION="$1"
+    # Define region
+    # Define output vcf name for region
+    OUT="tmp_${PREFIX}.${REGION}.vcf.gz"
+    echo "[START] ${REGION}"
+    ${BCFTOOLS:-bcftools} mpileup --redo-BAQ --max-depth ${maxsampledepth} --min-BQ 15 -q 30 \
+        -a DP,AD -r "${REGION}" -Ou -f "${REFERENCE}" --bam-list "${BAMFILES}" | \
+    ${BCFTOOLS:-bcftools} call -m -a GQ --group-samples - \
+        --ploidy-file "${PLOIDYFILE}" --samples-file "${SEXFILE}" -Ou | \
+    ${BCFTOOLS:-bcftools} norm -f "${REFERENCE}" --check-ref w -Oz -o "${OUT}"
+    bcftools index -t "${OUT}"
+}
+export -f call_region
+#################################################
+# EXECUTION
+#################################################
+echo "Running parallel variant calling..."
+parallel --jobs ${NJOBS} --joblog parallel.log --eta call_region {} :::: ${REGIONS}
+#################################################
+# CATEGORIZED CONCATENATION
+#################################################
+echo "Organizing VCFs into categories..."
+# 1. Autosomes (scaffold_1 to 25, minus scaffold_3)
+# The ':' anchor ensures scaffold_1: matches, but scaffold_10: does not.
+ls tmp_${PREFIX}.scaffold_*:*-*.vcf.gz | grep -E "scaffold_([1-9]|1[0-9]|2[0-5]):" | grep -v "scaffold_3:" > list_auto.txt
+bcftools concat -f list_auto.txt -a -Oz -o "${PREFIX}_autosomes.vcf.gz"
+# 2. X Chromosome (scaffold_3)
+ls tmp_${PREFIX}.scaffold_3:*-*.vcf.gz > list_X.txt
+bcftools concat -f list_X.txt -a -Oz -o "${PREFIX}_chrX.vcf.gz"
+# 3. Y Chromosome (scaffold_26)
+ls tmp_${PREFIX}.scaffold_26:*-*.vcf.gz > list_Y.txt
+bcftools concat -f list_Y.txt -a -Oz -o "${PREFIX}_chrY.vcf.gz"
+# 4. Mitochondria (ptg000146l_rotated)
+mv "tmp_${PREFIX}.ptg000146l_rotated:1-16335.vcf.gz" "${PREFIX}_mito.vcf.gz"
+# 5. Unplaced/Other Scaffolds
+cat list_auto.txt list_X.txt list_Y.txt > processed_files.txt
+ls tmp_${PREFIX}.*:*-*.vcf.gz > all_files.txt
+grep -Fvf processed_files.txt all_files.txt > list_other.txt
+bcftools concat -f list_other.txt -a -Oz -o "${PREFIX}_unplaced.vcf.gz"
+# Final Indexing and Cleanup
+for f in ${PREFIX}_*.vcf.gz; do bcftools index -t "$f"; done
+rm tmp_${PREFIX}.*:*-*.vcf.gz* list_*.txt all_files.txt processed_files.txt
+echo "Workflow complete."
+
+
+
+#### STEP4 - filter an autosomal VCF by an INFO/DP field. 
+#!/bin/bash
+set -e
+# Variables
+input_vcf="$1"
+output_vcf="${input_vcf%.vc*}_clean.vcf.gz"
+mindepth=234
+maxdepth=1079
+echo "Starting pipeline..."
+# remove indels and filter by INFO/DP
+bcftools view --threads 10 -V indels  "$input_vcf" -Ou | \
+bcftools filter -i "INFO/DP>=${mindepth} && INFO/DP<=${maxdepth}" -Oz -o "$output_vcf"
+# Create a CSI index for the final file
+bcftools index "$output_vcf"
+echo "Pipeline complete. Output: $output_vcf"
