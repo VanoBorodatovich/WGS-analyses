@@ -1,0 +1,162 @@
+# Here I collected code which was used to align and filter alignment of museum samples with moderately degraded DNA. It includes trimming with bbduk, aligning with bwa mem,
+# filtering with samtools, then removing reads with soft clipped bases. After these steps we analysed resulting BAMs with amber tool (https://github.com/tvandervalk/AMBER/blob/main/README.md)
+# and additionally removed some reads with selected length if these lengths were outliers in amber mismatch rate to read lengths plot. Then we analysed resulting BAMs with DamageProfiler
+# (https://github.com/Integrative-Transcriptomics/DamageProfiler) and trimmed some bases from read ends based on its results with fgbio (https://github.com/fulcrumgenomics/fgbio).
+# Resulting characteristic of BAMs, such as mean coverage and fragment insert-size distribution, were analysed with Qualimap (http://qualimap.conesalab.org/).
+
+##################
+# STEP 1: trimming
+#!/usr/bin/bash
+for f in *_R1.fastq.gz; do
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!">>trimmed/trim_log.txt
+echo ${f%_R1.*}>>trimmed/trim_log.txt
+bbduk.sh in1=$f in2=${f%R1.*}R2.fastq.gz out1=trimmed/${f%R1.*}tr_R1.fastq.gz out2=trimmed/${f%R1.*}tr_R2.fastq.gz ref=adapters.fa k=12 mink=12 ktrim=r minlen=40 tpe \
+tbo qtrim=r trimq=16 stats=trimmed/${f%R1.*}kstats 2>>trimmed/trim_log.txt
+done
+
+################################
+# STEP 2: aligning and filtering
+#!/usr/bin/bash
+set -euo pipefail
+shopt -s nullglob
+
+t=40
+REF="$HOME/ref/lemmus/combined/genome.fa"
+
+for f in *_R1.fastq.gz; do
+    R2="${f%R1.fastq.gz}R2.fastq.gz"
+    sample="${f%%_*}"
+    pair_id="${f%_R1.fastq.gz}"
+    out="${sample}_pure.bam"
+
+    if [[ ! -f "$R2" ]]; then
+        printf 'Missing R2 file: %s\n' "$R2" >&2
+        exit 1
+    fi
+
+    # ID identifies this FASTQ pair; SM identifies the sample.
+    RG="@RG\tID:${pair_id}\tSM:${sample}\tPL:ILLUMINA"
+
+ bwa mem -t "$t" -R "$RG" "$REF" "$f" "$R2" |
+        samtools view -@ "$t" -u - |
+        samtools sort -@ "$t" -n -u - |
+        samtools fixmate -@ "$t" -m -u - - |
+        samtools sort -@ "$t" -u - |
+        samtools markdup -@ "$t" -u - - |
+        samtools view -@ "$t" -b -f 2 -F 2828 -q 20 -o "$out" -
+# so we keep only properly paired reads and then filtered them by mapq 20
+    samtools index -@ "$t" "$out"
+
+    printf 'Done with %s\n' "$sample"
+done
+
+########################################
+# STEP 3: removing of soft clipped reads
+set -o pipefail
+
+max_soft=0
+input="$1"
+output="${1%.bam}_sf${max_soft}.bam"
+samtools view -h "$input" |
+    awk -v max_soft="$max_soft" '
+        BEGIN { FS = "\t" }
+
+        # Preserve SAM headers.
+        /^@/ { print; next }
+        {
+            cigar = $6
+            soft = 0
+            # Sum all soft-clipping operations in the CIGAR.
+            while (match(cigar, /[0-9]+S/)) {
+                soft += substr(cigar, RSTART, RLENGTH - 1)
+                cigar = substr(cigar, RSTART + RLENGTH)
+            }
+            if (soft <= max_soft)
+                print
+        }
+    ' |
+    samtools view -@ 4 -b -o "$output" -
+
+# Input must be coordinate-sorted for indexing.
+if [[ $? -eq 0 ]]; then
+    samtools index "$output"
+fi
+
+########################################
+# STEP 4: removing reads of given length
+#!/usr/bin/env bash
+set -euo pipefail
+
+input="$1"
+output="${1%.*}_filtl.bam"
+
+samtools view -h "$input" |
+    awk '/^@/ || (length($10) >= 40) '|
+    samtools view -b -o "$output" -
+
+samtools index "$output"
+
+####################################################
+# STEP 5: clipping bases on read ends using parallel
+# file clipping.txt contains three columns: file_name #_of_bases_to_trim_on_5' #to_trim_on_3'
+#!/usr/bin/env bash
+REF="$HOME/ref/lemmus/combined/genome.fa"
+JOBS=20
+THREADS=4
+export TMPDIR="$PWD/tmp"
+mkdir -p clipped "$TMPDIR"
+export REF THREADS
+clip_sample() {
+    local bam="$1"
+    local clip5="$2"
+    local clip3="$3"
+    local name out
+    name=$(basename "$bam" .bam)
+    out="clipped/${name}.clipped.bam"
+    set -o pipefail
+
+    samtools sort -n -u "$bam" |
+        fgbio -Xmx50g --tmp-dir "$TMPDIR" ClipBam  \
+            --input /dev/stdin \
+            --output "$out" \
+            --ref "$REF" \
+            --clipping-mode Hard \
+            --read-one-five-prime "$clip5" \
+            --read-two-five-prime "$clip5" \
+            --read-one-three-prime "$clip3" \
+            --read-two-three-prime "$clip3" \
+            --sort-order Coordinate \
+        || return 1
+    samtools index -@ "$THREADS" "$out"
+}
+export -f clip_sample
+export SHELL=/bin/bash
+
+parallel --jobs "$JOBS" --verbose \
+    --colsep '[[:space:]]+' \
+    --halt soon,fail=1 \
+    --joblog clipped/jobs.tsv \
+    clip_sample {1} {2} {3} :::: clipping.txt
+
+#######################################################
+# STEP 6: run all quality assesment programs parallelly
+#!/usr/bin/bash
+t=10
+ls *bam | parallel --jobs "$t" --verbose "qualimap bamqc --java-mem-size=16G -c -ip -sd -sdmode 0 -bam {} -outdir bamstats/{.}_quali"
+
+ls *bam | parallel --jobs "$t" --verbose "java -Xmx48G -jar ~/apps/DamageProfiler-1.1-java11.jar -i {} -o bamstats/{.}_dam -r ~/ref/lemmus/combined/genome.fa"
+
+run_amber() {
+    local sam="$1"
+    local filename name path
+    filename=$(basename "$sam")
+    name="${filename%%_*}"
+    path=$(realpath "$sam") || return 1
+    printf '%s\t%s\n' "$name" "$path" > "${name}_amber.tsv" || return 1
+    MPLBACKEND=Agg python -m amber --bamfiles "${name}_amber.tsv" --output "${name}_amber" || return 1
+    realpath "${name}_amber"
+}
+# amber is installed in separate python env
+export -f run_amber
+source "$HOME/apps/amber-venv/bin/activate"
+ls *.bam | parallel -j "$t" --verbose run_amber {}
