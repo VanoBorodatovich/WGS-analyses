@@ -1,0 +1,84 @@
+# Here is a script to align NGS data of ancient samples (ancient DNA) and of highly degraded museum samples. First it merges paired end fastq data with bbmerge. Then aligns separately merged reads
+# and reads that failed to merge. Both aligning steps contain their own filtering procedure, duplicate marking and so on. At last stage it merges both bam files in one. damage-aware base-quality rescaling
+# with mapdamage (https://ginolhac.github.io/mapDamage/) is recommended for resulting bam (here is not prese. 
+# We added the aligning of not merged reads in order to retain as many information as possible. While for highly degraded aDNA samples there will not be template fragmnets with length higher than 200-250 bp
+# (so all endogeneous reads will merge) we still encounter aDNA NGS data with better quality and presence of some fragmants with bigger length.
+
+#!/usr/bin/env bash
+set -euo pipefail
+set -x
+
+# Launch parallel jobs when called without arguments.
+# Each job calls this script with one R1 file.
+if (( $# == 0 )); then
+    mkdir -p log sep_bams tmp combined_bams
+
+    find . -maxdepth 1 -type f -name '*R1.fastq.gz' -printf '%f\0' |
+        parallel --null --jobs 20 \
+            --halt soon,fail=1 \
+            --joblog log/parallel_jobs.tsv \
+            bash "$0" {} \
+            '>' 'log/{%}_stdout.log' \
+            '2>' 'log/{%}_stderr.log'
+
+    exit 0
+fi
+
+REF="$HOME/ref/lemmus/combined/genome.fa"
+T=2
+BWA_N=0.01
+log=log
+sep_bams=sep_bams
+tmp=tmp
+final_bams=combined_bams
+
+# define sample
+sample="${1%_tr*}"
+R1="${sample}_tr_R1.fastq.gz"
+R2="${sample}_tr_R2.fastq.gz"
+# define RG tags
+sam_name="${1%%_*}"
+lib="${1%%_*}"
+RG="@RG\tID:${lib}\tSM:${sam_name}\tLB:${lib}\tPL:ILLUMINA"
+
+    echo "Processing $sample"
+
+    # === MERGE === #
+    bbmerge.sh in1="$R1" in2="$R2" out="${sample}_merged.fastq.gz" t="$T"\
+       outu1="${sample}_unmerged_R1.fastq.gz" outu2="${sample}_unmerged_R2.fastq.gz" \
+       2> "$log/${sample}_bbmerge.log"
+
+    # === ALIGN MERGED === #
+    bwa aln -n "$BWA_N" -l 1024 -t "$T" "$REF" "${sample}_merged.fastq.gz" > "$tmp/${sample}_merged.sai"
+    bwa samse  -r "$RG" "$REF" "$tmp/${sample}_merged.sai" "${sample}_merged.fastq.gz" | \
+        samtools view -@ "$T" -bS -F 2308 -q 20 - | \
+        samtools sort -@ "$T" -o "$tmp/${sample}_merged_sorted.bam" -
+
+    java -Xmx16G -jar ~/apps/picard.jar MarkDuplicates \
+        I="$tmp/${sample}_merged_sorted.bam" \
+        O="$sep_bams/${sample}_merged.bam" \
+        M="$log/${sample}_merged_dup_metrics.txt" \
+        REMOVE_DUPLICATES=false \
+        ASSUME_SORTED=true \
+        VALIDATION_STRINGENCY=LENIENT
+    samtools index "$sep_bams/${sample}_merged.bam"
+
+    # === ALIGN UNMERGED (PAIRED-END) === #
+    bwa aln -n "$BWA_N" -l 1024 -t "$T" "$REF" "${sample}_unmerged_R1.fastq.gz" > "$tmp/${sample}_R1.sai"
+    bwa aln -n "$BWA_N" -l 1024 -t "$T" "$REF" "${sample}_unmerged_R2.fastq.gz" > "$tmp/${sample}_R2.sai"
+
+    bwa sampe  -r "$RG" "$REF" "$tmp/${sample}_R1.sai" "$tmp/${sample}_R2.sai" \
+        "${sample}_unmerged_R1.fastq.gz" "${sample}_unmerged_R2.fastq.gz" | \
+        samtools sort  -@ "$T" -n -u - | \
+        samtools fixmate  -@ "$T" -m -u - - | \
+        # after that mapped to different chr are marked
+        samtools sort  -@ "$T" - | \
+        samtools markdup -@ "$T" - - |\
+        samtools view -@ "$T" -bS -f 2 -F 2820 -q 20 -o "$sep_bams/${sample}_unmerged.bam" -
+
+    # === MERGE MERGED + UNMERGED === #
+    samtools merge -@ "$T" -c -f "$final_bams/${sample}_combined.bam" \
+    "$sep_bams/${sample}_merged.bam" "$sep_bams/${sample}_unmerged.bam"
+    samtools index "$final_bams/${sample}_combined.bam"
+
+    echo "Finished $sample"
